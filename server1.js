@@ -1,56 +1,30 @@
 require('dotenv').config();
 const express = require('express');
 const puppeteer = require('puppeteer');
-const { google } = require('googleapis');
 const { spawn } = require('child_process');
 const path = require('path');
-const fs = require('fs');
+const { getNextMeetingLink } = require('./test'); // Your calendar logic file
 
 const app = express();
 app.use(express.json());
 
-const SCOPES = ['https://www.googleapis.com/auth/calendar.readonly'];
-const GOOGLE_CREDENTIALS_PATH = process.env.GOOGLE_CREDENTIALS_PATH;
+app.post('/join-scheduled-meeting', async (req, res) => {
+    const meetingLink = await getNextMeetingLink();
 
-async function getCalendarEvents() {
-    const auth = new google.auth.GoogleAuth({
-        keyFile: GOOGLE_CREDENTIALS_PATH,
-        scopes: SCOPES,
-    });
-    const calendar = google.calendar({ version: 'v3', auth });
-    
-    const now = new Date();
-    const events = await calendar.events.list({
-        calendarId: 'primary',
-        timeMin: now.toISOString(),
-        maxResults: 10,
-        singleEvents: true,
-        orderBy: 'startTime',
-    });
-    
-    return events.data.items.filter(event => event.hangoutLink || event.description);
-}
-
-async function getTeamsMeetingLink() {
-    const events = await getCalendarEvents();
-    for (let event of events) {
-        const teamsLink = event.description?.match(/https:\/\/teams\.live\.com\/[^"]+/)?.[0];
-        if (teamsLink) {
-            return teamsLink;
-        }
+    if (!meetingLink) {
+        return res.status(404).json({ error: 'No Teams meeting link found in upcoming events.' });
     }
-    return null;
-}
 
-async function joinTeamsMeeting(meetingLink) {
+    console.log("🎯 Joining scheduled meeting:", meetingLink);
+
     let browser;
     let ffmpegProcess;
     const outputFile = path.join(__dirname, `meeting_recording_${Date.now()}.mp4`);
 
     try {
-        console.log("🚀 Launching headless browser...");
+        console.log("🚀 Launching browser...");
         browser = await puppeteer.launch({
-            headless: true,
+            headless: false,
             args: [
                 '--use-fake-ui-for-media-stream',
                 '--use-fake-device-for-media-stream',
@@ -66,23 +40,46 @@ async function joinTeamsMeeting(meetingLink) {
         console.log(`🌍 Opening Teams meeting: ${meetingLink}`);
         await page.goto(meetingLink, { waitUntil: 'networkidle2' });
 
+        console.log("🔎 Looking for 'Continue on this browser' button...");
         const continueButton = await page.waitForSelector('button[data-tid="joinOnWeb"]', { timeout: 30000 });
-        if (continueButton) await continueButton.click();
 
-        await page.waitForSelector('input[data-tid="prejoin-display-name-input"]', { timeout: 10000 });
-        await page.type('input[data-tid="prejoin-display-name-input"]', 'Bot');
-        
-        await page.waitForSelector('button[data-tid="prejoin-join-button"]', { timeout: 10000 });
-        await page.click('button[data-tid="prejoin-join-button"]');
+        if (continueButton) {
+            console.log("Clicking 'Continue on this browser'...");
+            await continueButton.click();
+        } else {
+            throw new Error("❌ 'Continue on this browser' button not found!");
+        }
+
+        const nameInputSelector = 'input[data-tid="prejoin-display-name-input"]';
+        await page.waitForSelector(nameInputSelector, { timeout: 10000 });
+        await page.type(nameInputSelector, 'Bot');
+        console.log('Typed "Bot" in the name field');
+
+        const joinNowButtonSelector = 'button[data-tid="prejoin-join-button"]';
+        await page.waitForSelector(joinNowButtonSelector, { timeout: 10000 });
+        await page.click(joinNowButtonSelector);
+        console.log('Clicked "Join now" button');
+
+        console.log("⏳ Waiting for host approval...");
+        try {
+            const allowButtonSelector = 'button[aria-label="Allow"]';
+            await page.waitForSelector(allowButtonSelector, { timeout: 30000 });
+            await page.click(allowButtonSelector);
+            console.log("Allowed into the meeting automatically!");
+        } catch (error) {
+            console.log("No approval needed or timeout reached.");
+        }
 
         console.log("✅ Successfully joined the meeting!");
+        res.json({ success: true, message: 'Bot joined the Teams meeting!' });
 
-        // 🎥 Start Recording
+        // **🎥 Start recording as soon as the bot joins the meeting**
+        console.log("🎥 Starting screen and audio recording using FFmpeg...");
         ffmpegProcess = spawn('ffmpeg', [
-            '-f', 'avfoundation',
-            '-i', '1:1',
-            '-r', '30',
-            '-video_size', '1920x1080',
+            '-f', 'avfoundation',   // Use avfoundation for macOS
+            '-i', '1:1',            // Screen index 1, Audio index 1 (BlackHole 2ch)
+            '-r', '30',             // 30 FPS
+            '-video_size', '1920x1080',  // Set resolution
             '-vcodec', 'libx264',
             '-preset', 'ultrafast',
             '-pix_fmt', 'yuv420p',
@@ -95,7 +92,9 @@ async function joinTeamsMeeting(meetingLink) {
 
         ffmpegProcess.stdout.on('data', (data) => console.log(`FFmpeg: ${data}`));
         ffmpegProcess.stderr.on('data', (data) => console.error(`FFmpeg error: ${data}`));
+        console.log(`📂 Recording started. Saving to: ${outputFile}`);
 
+        // **🛑 Monitor for the "Meeting ended" screen in parallel**
         let meetingActive = true;
         (async () => {
             while (meetingActive) {
@@ -105,32 +104,24 @@ async function joinTeamsMeeting(meetingLink) {
 
                 if (!leaveButtonExists) {
                     console.log("❌ Meeting has ended! Stopping recording...");
-                    ffmpegProcess.kill('SIGINT');
+                    ffmpegProcess.kill('SIGINT'); // Stop FFmpeg
                     meetingActive = false;
+                } else {
+                    console.log("✅ Meeting still ongoing...");
                 }
-                await new Promise(resolve => setTimeout(resolve, 5000));
+                await new Promise(resolve => setTimeout(resolve, 5000)); // Check every 5 sec
             }
+
             console.log("🚪 Closing browser...");
             await browser.close();
         })();
+
     } catch (error) {
         console.error("❌ Error:", error);
+        res.status(500).json({ error: error.message });
     }
-}
-
-app.post('/join-teams', async (req, res) => {
-    const meetingLink = await getTeamsMeetingLink();
-    if (!meetingLink) {
-        return res.status(404).json({ error: 'No upcoming Teams meeting found in Google Calendar' });
-    }
-    await joinTeamsMeeting(meetingLink);
-    res.json({ success: true, message: 'Bot joined the Teams meeting!' });
 });
 
 app.listen(5090, () => {
-    console.log('🚀 Server running on port 5090, checking Google Calendar every 5 minutes...');
-    setInterval(async () => {
-        const meetingLink = await getTeamsMeetingLink();
-        if (meetingLink) await joinTeamsMeeting(meetingLink);
-    }, 5 * 60 * 1000);
+    console.log('🚀 Server running on port 5090');
 });
