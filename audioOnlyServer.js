@@ -34,12 +34,16 @@ app.post('/join-teams', async (req, res) => {
         browser = await puppeteer.launch({
             headless: false,
             args: [
+                '--window-size=1920,1080', // Full HD window size
+                '--start-maximized',       // Attempt to maximize the window
                 '--use-fake-ui-for-media-stream',
                 '--use-fake-device-for-media-stream',
                 '--disable-blink-features=AutomationControlled',
                 '--disable-features=IsolateOrigins,site-per-process'
-            ]
+            ],
+            defaultViewport: null // This is important to use full window size
         });
+        
 
         const context = browser.defaultBrowserContext();
         await context.overridePermissions("https://teams.live.com", ["microphone", "camera"]);
