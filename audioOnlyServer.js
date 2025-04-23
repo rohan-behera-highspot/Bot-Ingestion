@@ -13,6 +13,7 @@ app.use(cors({
     credentials: true
 }));
 
+// Replace the mic/camera section with this improved version
 app.post('/join-teams', async (req, res) => {
     const { meetingLink } = req.body;
     console.log("Request received:", req.body);
@@ -34,17 +35,16 @@ app.post('/join-teams', async (req, res) => {
         browser = await puppeteer.launch({
             headless: false,
             args: [
-                '--window-size=1920,1080', // Full HD window size
-                '--start-maximized',       // Attempt to maximize the window
+                '--window-size=1920,1080', 
+                '--start-maximized',       
                 '--use-fake-ui-for-media-stream',
                 '--use-fake-device-for-media-stream',
                 '--disable-blink-features=AutomationControlled',
                 '--disable-features=IsolateOrigins,site-per-process'
             ],
-            defaultViewport: null // This is important to use full window size
+            defaultViewport: null
         });
         
-
         const context = browser.defaultBrowserContext();
         await context.overridePermissions("https://teams.live.com", ["microphone", "camera"]);
 
@@ -73,7 +73,7 @@ app.post('/join-teams', async (req, res) => {
         console.log("⏳ Waiting for host approval...");
         try {
             const allowButtonSelector = 'button[aria-label="Allow"]';
-            await page.waitForSelector(allowButtonSelector, { timeout: 30000 });
+            await page.waitForSelector(allowButtonSelector, { timeout: 10000 });
             await page.click(allowButtonSelector);
             console.log("Allowed into the meeting automatically!");
         } catch {
@@ -82,33 +82,68 @@ app.post('/join-teams', async (req, res) => {
 
         console.log("✅ Successfully joined the meeting!");
 
-        // 🔇 Turn off mic and camera after joining
-        try {
-            const micBtn = '#microphone-button';
-            const camBtn = '#video-button';
+        // IMPROVED SECTION: Turn off mic and camera after joining with more reliable detection
+        console.log("🔄 Attempting to turn off mic and camera...");
+        
+        // Wait for meeting UI to fully load first (more reliable approach)
+        await page.waitForFunction(() => {
+            // Check if we're fully in the meeting by looking for key UI elements
+            return document.querySelector('button[aria-label*="Leave"]') !== null;
+        }, { timeout: 15000 }).catch(e => console.log("Meeting UI wait timed out, proceeding anyway:", e.message));
+        
+        // Define multiple possible selectors for robustness
+        const micSelectors = [
+            '#microphone-button' 
+            // 'button[aria-label*="Mute"]',
+            // 'button[data-tid="toggle-mute"]',
+            // 'button[title*="Mute"]'
+        ];
+        
+        const camSelectors = [
+            '#video-button' 
+            // 'button[aria-label*="camera"]',
+            // 'button[data-tid="toggle-video"]',
+            // 'button[title*="camera"]'
+        ];
 
-            await page.waitForSelector(micBtn, { timeout: 10000 });
-            await page.waitForSelector(camBtn, { timeout: 10000 });
-
-            const micLabel = await page.$eval(micBtn, el => el.getAttribute('aria-label'));
-            const camLabel = await page.$eval(camBtn, el => el.getAttribute('aria-label'));
-
-            if (micLabel && micLabel.toLowerCase().includes('mute')) {
-                await page.click(micBtn);
-                console.log("🎤 Microphone turned off");
-            } else {
-                console.log("🎤 Microphone already off");
+        // Function to try multiple selectors
+        async function clickButtonWithMultipleSelectors(selectors, actionName) {
+            for (const selector of selectors) {
+                try {
+                    const exists = await page.$(selector);
+                    if (exists) {
+                        // Check if we need to turn it off by examining the button state
+                        const ariaLabel = await page.$eval(selector, el => el.getAttribute('aria-label') || el.title || '');
+                        const needsToToggle = ariaLabel.toLowerCase().includes('mute') || 
+                                            ariaLabel.toLowerCase().includes('turn off') || 
+                                            ariaLabel.toLowerCase().includes('camera off');
+                        
+                        if (needsToToggle) {
+                            await page.click(selector);
+                            console.log(`✅ ${actionName} toggled using selector: ${selector}`);
+                            return true;
+                        } else {
+                            console.log(`✅ ${actionName} already in desired state according to: ${selector}`);
+                            return true;
+                        }
+                    }
+                } catch (err) {
+                    console.log(`Failed with selector ${selector}:`, err.message);
+                }
             }
+            return false;
+        }
 
-            if (camLabel && camLabel.toLowerCase().includes('turn camera on')) {
-                console.log("📷 Camera already off");
-            } else {
-                await page.click(camBtn);
-                console.log("📷 Camera turned off");
-            }
-
-        } catch (err) {
-            console.warn("⚠️ Failed to toggle mic/camera:", err.message);
+        // Try to turn off mic with multiple attempts
+        let micSuccess = await clickButtonWithMultipleSelectors(micSelectors, "Microphone");
+        if (!micSuccess) {
+            console.warn("⚠️ Could not find or toggle microphone button");
+        }
+        
+        // Try to turn off camera with multiple attempts
+        let camSuccess = await clickButtonWithMultipleSelectors(camSelectors, "Camera");
+        if (!camSuccess) {
+            console.warn("⚠️ Could not find or toggle camera button");
         }
 
         console.log("🎤 Starting audio recording using FFmpeg...");
